@@ -18,31 +18,6 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Check for vulnerabilities
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
-
-      - name: Generate embedded docs
-        run: go generate ./...
-
-      - name: Build
-        run: |
-          CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -o sg-mcp-linux-amd64 .
-          CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -o sg-mcp-linux-arm64 .
-          CGO_ENABLED=0 GOOS=darwin  GOARCH=amd64 go build -o sg-mcp-darwin-amd64 .
-          CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -o sg-mcp-darwin-arm64 .
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o sg-mcp-windows-amd64.exe .
-
-      - name: Release
+      - run: ./scripts/release.sh "${{ github.ref_name }}"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --notes "$(git tag -l --format='%(contents)' '${{ github.ref_name }}')" \
-            sg-mcp-linux-amd64 \
-            sg-mcp-linux-arm64 \
-            sg-mcp-darwin-amd64 \
-            sg-mcp-darwin-arm64 \
-            sg-mcp-windows-amd64.exe
