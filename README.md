@@ -80,6 +80,9 @@ go run . -http
 go run . -http -addr :8080
 ```
 
+### Binary Files
+pre-build binaries can be found on the [Releases page](https://github.com/rfletchr/ShotgunMcpGo/releases)
+
 ## Connecting
 
 ### Claude Code CLI
