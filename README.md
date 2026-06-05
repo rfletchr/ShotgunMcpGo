@@ -1,6 +1,8 @@
 # Shotgrid MCP Server
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server for ShotGrid (aka. Flow Production Tracking, Shotgun, Shitgord, Prince). Gives LLMs direct READ-ONLY access to your ShotGrid instance — schema discovery, live queries, filter/operator reference, and embedded API documentation.
+This is designed to enable LLMs to reliably write code not to manipulate production data (which is a very risky thing to let a LLM do). 
+
 
 Built on [ShotgunGo](https://github.com/rfletchr/ShotgunGo) and [mcp-go](https://github.com/mark3labs/mcp-go). Compiles to a single self-contained binary with all documentation embedded.
 
