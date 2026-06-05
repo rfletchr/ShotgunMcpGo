@@ -10,14 +10,14 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net/http"
 	"os"
 	"path"
 	"sort"
 	"strings"
 	"sync"
 
-	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
+	minimcp "github.com/rfletchr/MiniMCP"
 	sg "github.com/rfletchr/ShotgunGo"
 )
 
@@ -36,6 +36,10 @@ var (
 	sgOnce   sync.Once
 	sgErr    error
 )
+
+var defaultSearchEntityTypes = []string{
+	"Project", "Episode", "Sequence", "Shot", "Asset", "Version", "Task",
+}
 
 func getClient() (*sg.Client, error) {
 	sgOnce.Do(func() {
@@ -99,6 +103,29 @@ func parseFilters(raw string) (sg.Condition, error) {
 		return conditions[0], nil
 	}
 	return sg.And(conditions...), nil
+}
+
+// parseOrder converts a JSON string of [[field, direction], ...] to []sg.OrderField.
+func parseOrder(raw string) ([]sg.OrderField, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var pairs [][]string
+	if err := json.Unmarshal([]byte(raw), &pairs); err != nil {
+		return nil, fmt.Errorf("order must be a JSON array of [field, direction] pairs: %w", err)
+	}
+	fields := make([]sg.OrderField, 0, len(pairs))
+	for _, pair := range pairs {
+		if len(pair) != 2 {
+			return nil, fmt.Errorf("each order entry must have exactly 2 elements: [field, direction]")
+		}
+		dir := sg.OrderDirection(strings.ToLower(pair[1]))
+		if dir != sg.Asc && dir != sg.Desc {
+			return nil, fmt.Errorf("order direction must be \"asc\" or \"desc\", got %q", pair[1])
+		}
+		fields = append(fields, sg.OrderField{Field: pair[0], Direction: dir})
+	}
+	return fields, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -209,22 +236,85 @@ var dataTypes = map[string]any{
 	"url":          map[string]any{"value": "dict | null", "structure": "{\"content_type\": string, \"link_type\": \"local\" | \"url\" | \"upload\", \"name\": string, \"url\": string}"},
 }
 
+type summarizeTypeInfo struct {
+	SummaryTypes  []string `json:"summary_types"`
+	GroupingTypes []string `json:"grouping_types"`
+}
+
+var summarizeTypes = map[string]summarizeTypeInfo{
+	"addressing":   {SummaryTypes: []string{"record_count", "count"}, GroupingTypes: []string{"exact", "entitytype"}},
+	"checkbox":     {SummaryTypes: []string{"record_count", "count", "checked", "unchecked"}, GroupingTypes: []string{"exact"}},
+	"currency":     {SummaryTypes: []string{"record_count", "count", "sum", "maximum", "minimum", "average"}, GroupingTypes: []string{"exact", "tens", "hundreds", "thousands", "tensofthousands", "hundredsofthousands", "millions"}},
+	"date":         {SummaryTypes: []string{"record_count", "count", "earliest", "latest"}, GroupingTypes: []string{"exact", "day", "week", "month", "quarter", "year", "clustered_date", "oneday", "fivedays"}},
+	"date_time":    {SummaryTypes: []string{"record_count", "count", "earliest", "latest"}, GroupingTypes: []string{"exact", "day", "week", "month", "quarter", "year", "clustered_date", "oneday", "fivedays"}},
+	"duration":     {SummaryTypes: []string{"record_count", "count", "sum", "maximum", "minimum", "average"}, GroupingTypes: []string{"exact", "tens", "hundreds", "thousands", "tensofthousands", "hundredsofthousands", "millions"}},
+	"entity":       {SummaryTypes: []string{"record_count", "count"}, GroupingTypes: []string{"exact", "entitytype"}},
+	"float":        {SummaryTypes: []string{"record_count", "count", "sum", "maximum", "minimum", "average"}, GroupingTypes: []string{"exact", "tens", "hundreds", "thousands", "tensofthousands", "hundredsofthousands", "millions"}},
+	"list":         {SummaryTypes: []string{"record_count", "count"}, GroupingTypes: []string{"exact", "firstletter"}},
+	"multi_entity": {SummaryTypes: []string{"record_count", "count"}, GroupingTypes: []string{"exact", "entitytype"}},
+	"number":       {SummaryTypes: []string{"record_count", "count", "sum", "maximum", "minimum", "average"}, GroupingTypes: []string{"exact", "tens", "hundreds", "thousands", "tensofthousands", "hundredsofthousands", "millions"}},
+	"percent":      {SummaryTypes: []string{"record_count", "count", "sum", "maximum", "minimum", "average", "percentage"}, GroupingTypes: []string{"exact", "tens", "hundreds", "thousands", "tensofthousands", "hundredsofthousands", "millions"}},
+	"status_list":  {SummaryTypes: []string{"record_count", "count", "status_percentage", "status_percentage_as_float", "status_list"}, GroupingTypes: []string{"exact", "firstletter"}},
+	"tag_list":     {SummaryTypes: []string{"record_count", "count"}, GroupingTypes: []string{"exact"}},
+	"text":         {SummaryTypes: []string{"record_count", "count"}, GroupingTypes: []string{"exact", "firstletter"}},
+	"timecode":     {SummaryTypes: []string{"record_count", "count", "sum", "maximum", "minimum", "average"}, GroupingTypes: []string{"exact", "tens", "hundreds", "thousands", "tensofthousands", "hundredsofthousands", "millions"}},
+}
+
+// ---------------------------------------------------------------------------
+// flattenEntity
+// ---------------------------------------------------------------------------
+
+// flattenEntity converts a REST API entity envelope into the conventional
+// ShotGrid format: type, id, and all field values at the top level.
+func flattenEntity(raw map[string]any) map[string]any {
+	result := make(map[string]any)
+	if v, ok := raw["type"]; ok {
+		result["type"] = v
+	}
+	if v, ok := raw["id"]; ok {
+		result["id"] = v
+	}
+	if attrs, ok := raw["attributes"].(map[string]any); ok {
+		for k, v := range attrs {
+			result[k] = v
+		}
+	}
+	if rels, ok := raw["relationships"].(map[string]any); ok {
+		for k, v := range rels {
+			if rel, ok := v.(map[string]any); ok {
+				if data, hasData := rel["data"]; hasData {
+					result[k] = data
+				}
+			}
+		}
+	}
+	return result
+}
+
 // ---------------------------------------------------------------------------
 // Tool handlers
 // ---------------------------------------------------------------------------
 
-func handleEntityTypes(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func handleInitialize(_ json.RawMessage) (string, bool) {
+	return queryGuide, false
+}
+
+func handleEntityTypes(args json.RawMessage) (string, bool) {
+	var p struct {
+		ProjectID int `json:"project_id"`
+	}
+	json.Unmarshal(args, &p)
 	c, err := getClient()
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return err.Error(), true
 	}
 	var opts []int
-	if pid := req.GetInt("project_id", 0); pid != 0 {
-		opts = append(opts, pid)
+	if p.ProjectID != 0 {
+		opts = append(opts, p.ProjectID)
 	}
-	types, err := c.EntityTypes(ctx, opts...)
+	types, err := c.EntityTypes(context.Background(), opts...)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return err.Error(), true
 	}
 	names := make([]string, 0, len(types))
 	for name := range types {
@@ -232,25 +322,28 @@ func handleEntityTypes(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 	}
 	sort.Strings(names)
 	data, _ := json.MarshalIndent(names, "", "  ")
-	return mcp.NewToolResultText(string(data)), nil
+	return string(data), false
 }
 
-func handleFieldNames(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	entityType, err := req.RequireString("entity_type")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+func handleFieldNames(args json.RawMessage) (string, bool) {
+	var p struct {
+		EntityType string `json:"entity_type"`
+		ProjectID  int    `json:"project_id"`
+	}
+	if err := json.Unmarshal(args, &p); err != nil || p.EntityType == "" {
+		return "entity_type is required", true
 	}
 	c, err := getClient()
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return err.Error(), true
 	}
 	var opts []int
-	if pid := req.GetInt("project_id", 0); pid != 0 {
-		opts = append(opts, pid)
+	if p.ProjectID != 0 {
+		opts = append(opts, p.ProjectID)
 	}
-	fields, err := c.Fields(ctx, entityType, opts...)
+	fields, err := c.Fields(context.Background(), p.EntityType, opts...)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return err.Error(), true
 	}
 	names := make([]string, 0, len(fields))
 	for name := range fields {
@@ -258,30 +351,33 @@ func handleFieldNames(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTo
 	}
 	sort.Strings(names)
 	data, _ := json.MarshalIndent(names, "", "  ")
-	return mcp.NewToolResultText(string(data)), nil
+	return string(data), false
 }
 
-func handleSchema(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	entityType, err := req.RequireString("entity_type")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+func handleSchema(args json.RawMessage) (string, bool) {
+	var p struct {
+		EntityType string   `json:"entity_type"`
+		Fields     []string `json:"fields"`
+		ProjectID  int      `json:"project_id"`
+	}
+	if err := json.Unmarshal(args, &p); err != nil || p.EntityType == "" {
+		return "entity_type is required", true
 	}
 	c, err := getClient()
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return err.Error(), true
 	}
 	var opts []int
-	if pid := req.GetInt("project_id", 0); pid != 0 {
-		opts = append(opts, pid)
+	if p.ProjectID != 0 {
+		opts = append(opts, p.ProjectID)
 	}
-	fields, err := c.Fields(ctx, entityType, opts...)
+	fields, err := c.Fields(context.Background(), p.EntityType, opts...)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return err.Error(), true
 	}
-	// filter to requested fields if specified
-	if requested, err := req.RequireStringSlice("fields"); err == nil && len(requested) > 0 {
-		want := make(map[string]bool, len(requested))
-		for _, f := range requested {
+	if len(p.Fields) > 0 {
+		want := make(map[string]bool, len(p.Fields))
+		for _, f := range p.Fields {
 			want[f] = true
 		}
 		for name := range fields {
@@ -308,158 +404,261 @@ func handleSchema(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 		result[name] = entry
 	}
 	data, _ := json.MarshalIndent(result, "", "  ")
-	return mcp.NewToolResultText(string(data)), nil
+	return string(data), false
 }
 
-// parseOrder converts a JSON string of [[field, direction], ...] to []sg.OrderField.
-func parseOrder(raw string) ([]sg.OrderField, error) {
-	if raw == "" {
-		return nil, nil
+func handleFind(args json.RawMessage) (string, bool) {
+	var p struct {
+		EntityType string   `json:"entity_type"`
+		Filters    string   `json:"filters"`
+		Fields     []string `json:"fields"`
+		Limit      int      `json:"limit"`
+		Page       int      `json:"page"`
+		Order      string   `json:"order"`
 	}
-	var pairs [][]string
-	if err := json.Unmarshal([]byte(raw), &pairs); err != nil {
-		return nil, fmt.Errorf("order must be a JSON array of [field, direction] pairs: %w", err)
+	if err := json.Unmarshal(args, &p); err != nil {
+		return "invalid arguments: " + err.Error(), true
 	}
-	fields := make([]sg.OrderField, 0, len(pairs))
-	for _, pair := range pairs {
-		if len(pair) != 2 {
-			return nil, fmt.Errorf("each order entry must have exactly 2 elements: [field, direction]")
-		}
-		dir := sg.OrderDirection(strings.ToLower(pair[1]))
-		if dir != sg.Asc && dir != sg.Desc {
-			return nil, fmt.Errorf("order direction must be \"asc\" or \"desc\", got %q", pair[1])
-		}
-		fields = append(fields, sg.OrderField{Field: pair[0], Direction: dir})
+	if p.EntityType == "" {
+		return "entity_type is required", true
 	}
-	return fields, nil
-}
-
-func handleFind(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	entityType, err := req.RequireString("entity_type")
+	if p.Filters == "" {
+		return "filters is required", true
+	}
+	if len(p.Fields) == 0 {
+		return "fields is required", true
+	}
+	if p.Limit == 0 {
+		p.Limit = 50
+	}
+	if p.Page == 0 {
+		p.Page = 1
+	}
+	condition, err := parseFilters(p.Filters)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return err.Error(), true
 	}
-	filtersJSON, err := req.RequireString("filters")
+	orderFields, err := parseOrder(p.Order)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return err.Error(), true
 	}
-	fields, err := req.RequireStringSlice("fields")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	limit := req.GetInt("limit", 50)
-	pageNum := req.GetInt("page", 1)
-	orderJSON := req.GetString("order", "")
-
-	condition, err := parseFilters(filtersJSON)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	orderFields, err := parseOrder(orderJSON)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
 	c, err := getClient()
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return err.Error(), true
 	}
-
-	opts := []sg.QueryOption{sg.Fields(fields...), sg.PageSize(limit)}
+	opts := []sg.QueryOption{sg.Fields(p.Fields...), sg.PageSize(p.Limit)}
 	if condition != nil {
 		opts = append(opts, condition)
 	}
 	if len(orderFields) > 0 {
 		opts = append(opts, sg.Order(orderFields...))
 	}
-
-	page, err := c.Find(entityType, opts...).Page(ctx, pageNum)
+	page, err := c.Find(p.EntityType, opts...).Page(context.Background(), p.Page)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return err.Error(), true
 	}
-
 	results := make([]map[string]any, 0, len(page.Entities))
 	for _, e := range page.Entities {
 		var m map[string]any
 		if err := e.Decode(&m); err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return err.Error(), true
 		}
-		results = append(results, m)
+		results = append(results, flattenEntity(m))
 	}
-	data, _ := json.MarshalIndent(results, "", "  ")
-	return mcp.NewToolResultText(string(data)), nil
+	out := map[string]any{
+		"data":     results,
+		"has_next": page.HasNext(),
+		"has_prev": page.HasPrev(),
+	}
+	data, _ := json.MarshalIndent(out, "", "  ")
+	return string(data), false
 }
 
-func handleFindOne(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	entityType, err := req.RequireString("entity_type")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+func handleFindOne(args json.RawMessage) (string, bool) {
+	var p struct {
+		EntityType string   `json:"entity_type"`
+		Filters    string   `json:"filters"`
+		Fields     []string `json:"fields"`
+		Order      string   `json:"order"`
 	}
-	filtersJSON, err := req.RequireString("filters")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	if err := json.Unmarshal(args, &p); err != nil {
+		return "invalid arguments: " + err.Error(), true
 	}
-	fields, err := req.RequireStringSlice("fields")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	if p.EntityType == "" {
+		return "entity_type is required", true
 	}
-	orderJSON := req.GetString("order", "")
-
-	condition, err := parseFilters(filtersJSON)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	if p.Filters == "" {
+		return "filters is required", true
 	}
-	orderFields, err := parseOrder(orderJSON)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	if len(p.Fields) == 0 {
+		return "fields is required", true
 	}
-
+	condition, err := parseFilters(p.Filters)
+	if err != nil {
+		return err.Error(), true
+	}
+	orderFields, err := parseOrder(p.Order)
+	if err != nil {
+		return err.Error(), true
+	}
 	c, err := getClient()
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return err.Error(), true
 	}
-
-	opts := []sg.QueryOption{sg.Fields(fields...)}
+	opts := []sg.QueryOption{sg.Fields(p.Fields...)}
 	if condition != nil {
 		opts = append(opts, condition)
 	}
 	if len(orderFields) > 0 {
 		opts = append(opts, sg.Order(orderFields...))
 	}
-
-	entity, err := c.Find(entityType, opts...).One(ctx)
+	entity, err := c.Find(p.EntityType, opts...).One(context.Background())
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return err.Error(), true
 	}
 	if entity == nil {
-		return mcp.NewToolResultText("null"), nil
+		return "null", false
 	}
 	var m map[string]any
 	if err := entity.Decode(&m); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return err.Error(), true
 	}
-	data, _ := json.MarshalIndent(m, "", "  ")
-	return mcp.NewToolResultText(string(data)), nil
+	data, _ := json.MarshalIndent(flattenEntity(m), "", "  ")
+	return string(data), false
 }
 
-func handleOperators(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	fieldType := req.GetString("field_type", "")
-	if fieldType != "" {
-		ops, ok := operatorsByType[fieldType]
+func handleTextSearch(args json.RawMessage) (string, bool) {
+	var p struct {
+		Text          string `json:"text"`
+		EntityFilters string `json:"entity_filters"`
+		Limit         int    `json:"limit"`
+		Page          int    `json:"page"`
+		Order         string `json:"order"`
+	}
+	if err := json.Unmarshal(args, &p); err != nil {
+		return "invalid arguments: " + err.Error(), true
+	}
+	if p.Text == "" {
+		return "text is required", true
+	}
+	if p.Limit == 0 {
+		p.Limit = 50
+	}
+	if p.Page == 0 {
+		p.Page = 1
+	}
+	c, err := getClient()
+	if err != nil {
+		return err.Error(), true
+	}
+	q := c.TextSearch(p.Text).WithPageSize(p.Limit)
+	if p.EntityFilters != "" {
+		var rawFilters map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(p.EntityFilters), &rawFilters); err != nil {
+			return "entity_filters must be a JSON object mapping entity type to filter array: " + err.Error(), true
+		}
+		for entityType, raw := range rawFilters {
+			q.FilterEntityJSON(entityType, raw)
+		}
+	} else {
+		for _, entityType := range defaultSearchEntityTypes {
+			q.FilterEntityJSON(entityType, json.RawMessage("[]"))
+		}
+	}
+	if p.Order != "" {
+		orderFields, err := parseOrder(p.Order)
+		if err != nil {
+			return err.Error(), true
+		}
+		q.WithOrder(orderFields...)
+	}
+	page, err := q.Page(context.Background(), p.Page)
+	if err != nil {
+		return err.Error(), true
+	}
+	results := make([]map[string]any, 0, len(page.Entities))
+	for _, e := range page.Entities {
+		var m map[string]any
+		if err := e.Decode(&m); err != nil {
+			return err.Error(), true
+		}
+		results = append(results, flattenEntity(m))
+	}
+	out := map[string]any{
+		"data":     results,
+		"has_next": page.HasNext(),
+		"has_prev": page.HasPrev(),
+	}
+	data, _ := json.MarshalIndent(out, "", "  ")
+	return string(data), false
+}
+
+func handleSummarize(args json.RawMessage) (string, bool) {
+	var p struct {
+		EntityType    string `json:"entity_type"`
+		Filters       string `json:"filters"`
+		SummaryFields string `json:"summary_fields"`
+		Grouping      string `json:"grouping"`
+	}
+	if err := json.Unmarshal(args, &p); err != nil {
+		return "invalid arguments: " + err.Error(), true
+	}
+	if p.EntityType == "" {
+		return "entity_type is required", true
+	}
+	if p.Filters == "" {
+		return "filters is required", true
+	}
+	if p.SummaryFields == "" {
+		return "summary_fields is required", true
+	}
+	condition, err := parseFilters(p.Filters)
+	if err != nil {
+		return err.Error(), true
+	}
+	var summaryFields []sg.SummaryField
+	if err := json.Unmarshal([]byte(p.SummaryFields), &summaryFields); err != nil {
+		return "summary_fields must be a JSON array of {field, type} objects: " + err.Error(), true
+	}
+	var grouping []sg.GroupingField
+	if p.Grouping != "" {
+		if err := json.Unmarshal([]byte(p.Grouping), &grouping); err != nil {
+			return "grouping must be a JSON array of {field, type, direction} objects: " + err.Error(), true
+		}
+	}
+	c, err := getClient()
+	if err != nil {
+		return err.Error(), true
+	}
+	result, err := c.Summarize(context.Background(), p.EntityType, condition, summaryFields, grouping)
+	if err != nil {
+		return err.Error(), true
+	}
+	data, _ := json.MarshalIndent(result, "", "  ")
+	return string(data), false
+}
+
+func handleOperators(args json.RawMessage) (string, bool) {
+	var p struct {
+		FieldType string `json:"field_type"`
+	}
+	json.Unmarshal(args, &p)
+	if p.FieldType != "" {
+		ops, ok := operatorsByType[p.FieldType]
 		if !ok {
 			keys := make([]string, 0, len(operatorsByType))
 			for k := range operatorsByType {
 				keys = append(keys, k)
 			}
 			sort.Strings(keys)
-			return mcp.NewToolResultError(fmt.Sprintf("unknown or unsupported field type %q — filterable types: %s", fieldType, strings.Join(keys, ", "))), nil
+			return fmt.Sprintf("unknown or unsupported field type %q — filterable types: %s", p.FieldType, strings.Join(keys, ", ")), true
 		}
 		result := make(map[string]string, len(ops))
 		for _, op := range ops {
 			result[op] = operatorArgs[op]
 		}
-		data, _ := json.MarshalIndent(map[string]any{fieldType: result}, "", "  ")
-		return mcp.NewToolResultText(string(data)), nil
+		data, _ := json.MarshalIndent(map[string]any{p.FieldType: result}, "", "  ")
+		return string(data), false
 	}
 	result := make(map[string]map[string]string, len(operatorsByType))
 	for ft, ops := range operatorsByType {
@@ -469,120 +668,235 @@ func handleOperators(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolR
 		}
 	}
 	data, _ := json.MarshalIndent(result, "", "  ")
-	return mcp.NewToolResultText(string(data)), nil
+	return string(data), false
 }
 
-func handleDataTypes(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	fieldType := req.GetString("field_type", "")
-	if fieldType != "" {
-		info, ok := dataTypes[fieldType]
+func handleDataTypes(args json.RawMessage) (string, bool) {
+	var p struct {
+		FieldType string `json:"field_type"`
+	}
+	json.Unmarshal(args, &p)
+	if p.FieldType != "" {
+		info, ok := dataTypes[p.FieldType]
 		if !ok {
-			return mcp.NewToolResultError(fmt.Sprintf("unknown field type %q", fieldType)), nil
+			return fmt.Sprintf("unknown field type %q", p.FieldType), true
 		}
-		data, _ := json.MarshalIndent(map[string]any{fieldType: info}, "", "  ")
-		return mcp.NewToolResultText(string(data)), nil
+		data, _ := json.MarshalIndent(map[string]any{p.FieldType: info}, "", "  ")
+		return string(data), false
 	}
 	data, _ := json.MarshalIndent(dataTypes, "", "  ")
-	return mcp.NewToolResultText(string(data)), nil
+	return string(data), false
 }
 
-func handleDocsTopics(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func handleSummarizeTypes(args json.RawMessage) (string, bool) {
+	var p struct {
+		FieldType string `json:"field_type"`
+	}
+	json.Unmarshal(args, &p)
+	if p.FieldType != "" {
+		info, ok := summarizeTypes[p.FieldType]
+		if !ok {
+			keys := make([]string, 0, len(summarizeTypes))
+			for k := range summarizeTypes {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			return fmt.Sprintf("unknown field type %q — supported types: %s", p.FieldType, strings.Join(keys, ", ")), true
+		}
+		data, _ := json.MarshalIndent(map[string]any{p.FieldType: info}, "", "  ")
+		return string(data), false
+	}
+	data, _ := json.MarshalIndent(summarizeTypes, "", "  ")
+	return string(data), false
+}
+
+func handleDocsTopics(_ json.RawMessage) (string, bool) {
 	data, _ := json.MarshalIndent(docTopics(), "", "  ")
-	return mcp.NewToolResultText(string(data)), nil
+	return string(data), false
 }
 
-func handleDocs(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	topic, err := req.RequireString("topic")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+func handleDocs(args json.RawMessage) (string, bool) {
+	var p struct {
+		Topic string `json:"topic"`
 	}
-	content, err := readDoc(topic)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	if err := json.Unmarshal(args, &p); err != nil || p.Topic == "" {
+		return "topic is required", true
 	}
-	return mcp.NewToolResultText(content), nil
+	content, err := readDoc(p.Topic)
+	if err != nil {
+		return err.Error(), true
+	}
+	return content, false
 }
 
 // ---------------------------------------------------------------------------
 // Server setup
 // ---------------------------------------------------------------------------
 
-func buildServer() *server.MCPServer {
-	s := server.NewMCPServer("sg-mcp", "1.0.0")
+func buildServer() *minimcp.Dispatcher {
+	d := minimcp.NewDispatcher()
+	s := minimcp.NewServer("sg-mcp", "1.0.0")
 
-	s.AddTool(mcp.NewTool("sg_initialize",
-		mcp.WithDescription("Call before any other sg_* tool. Returns essential guidance on filter syntax, field naming, dot notation, ordering, and common gotchas."),
-	), func(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		return mcp.NewToolResultText(queryGuide), nil
-	})
+	s.AddTool(minimcp.Tool{
+		Name:        "sg_initialize",
+		Description: "Call before any other sg_* tool. Returns essential guidance on filter syntax, field naming, dot notation, ordering, and common gotchas.",
+		InputSchema: &minimcp.Schema{Type: "object"},
+	}, handleInitialize)
 
-	s.AddTool(mcp.NewTool("sg_entity_types",
-		mcp.WithDescription("List all entity types available in this ShotGrid instance."),
-		mcp.WithNumber("project_id", mcp.Description("Optional project ID to get entity types in the context of a specific project.")),
-	), handleEntityTypes)
-
-	s.AddTool(mcp.NewTool("sg_field_names",
-		mcp.WithDescription("List all field names for a ShotGrid entity type. Cheaper than sg_schema — use this first to discover fields, then call sg_schema for details on specific fields."),
-		mcp.WithString("entity_type", mcp.Required(), mcp.Description("PascalCase entity type name, e.g. Shot, HumanUser")),
-		mcp.WithNumber("project_id", mcp.Description("Optional project ID for project-specific field visibility.")),
-	), handleFieldNames)
-
-	s.AddTool(mcp.NewTool("sg_schema",
-		mcp.WithDescription("Get field details (type, label, description, valid values) for a ShotGrid entity type. Pass fields to limit results to specific fields rather than returning the full schema."),
-		mcp.WithString("entity_type", mcp.Required(), mcp.Description("PascalCase entity type name, e.g. Shot, HumanUser")),
-		mcp.WithArray("fields", mcp.Description("Optional list of field names to return details for. Omit to return all fields."), mcp.WithStringItems()),
-		mcp.WithNumber("project_id", mcp.Description("Optional project ID — required for accurate status values and project-specific field configuration.")),
-	), handleSchema)
-
-	s.AddTool(mcp.NewTool("sg_find",
-		mcp.WithDescription("Query ShotGrid entities. filters is a JSON string of [[field, operator, value], ...] triplets."),
-		mcp.WithString("entity_type", mcp.Required(), mcp.Description("Entity type to query, e.g. Shot, Task")),
-		mcp.WithString("filters", mcp.Required(), mcp.Description(`JSON array of [field, operator, value] triplets, e.g. [["sg_status_list","is","ip"],["project.Project.name","is","MyProject"]]`)),
-		mcp.WithArray("fields", mcp.Required(), mcp.Description("Fields to return"), mcp.WithStringItems()),
-		mcp.WithNumber("limit", mcp.Description("Max records to return (default 50)")),
-		mcp.WithNumber("page", mcp.Description("Page number, 1-indexed (default 1)")),
-		mcp.WithString("order", mcp.Description(`JSON array of [field, direction] pairs, e.g. [["created_at","desc"],["code","asc"]]`)),
-	), handleFind)
-
-	s.AddTool(mcp.NewTool("sg_find_one",
-		mcp.WithDescription("Fetch a single ShotGrid entity. filters is a JSON string of [[field, operator, value], ...] triplets."),
-		mcp.WithString("entity_type", mcp.Required(), mcp.Description("Entity type to query")),
-		mcp.WithString("filters", mcp.Required(), mcp.Description("JSON array of [field, operator, value] triplets")),
-		mcp.WithArray("fields", mcp.Required(), mcp.Description("Fields to return"), mcp.WithStringItems()),
-		mcp.WithString("order", mcp.Description(`JSON array of [field, direction] pairs, e.g. [["created_at","desc"]]`)),
-	), handleFindOne)
-
-	s.AddTool(mcp.NewTool("sg_operators",
-		mcp.WithDescription("Return valid filter operators and argument signatures. Pass a field type to filter, or omit for all types. Types that don't support filtering: password, serializable, summary, url."),
-		mcp.WithString("field_type", mcp.Description("Field type to get operators for, e.g. text, entity, date")),
-	), handleOperators)
-
-	s.AddTool(mcp.NewTool("sg_data_types",
-		mcp.WithDescription("Return ShotGrid data type documentation: value types, formats, and ranges."),
-		mcp.WithString("field_type", mcp.Description("Field type to get docs for, e.g. date, entity, url")),
-	), handleDataTypes)
-
-	s.AddTool(mcp.NewTool("sg_docs_topics",
-		mcp.WithDescription("List all available ShotGrid API documentation topics."),
-	), handleDocsTopics)
-
-	s.AddTool(mcp.NewTool("sg_docs",
-		mcp.WithDescription("Return ShotGrid API documentation for a topic. Call sg_docs_topics first to see what's available."),
-		mcp.WithString("topic", mcp.Required(), mcp.Description("Topic path, e.g. reference, cookbook/usage_tips")),
-	), handleDocs)
-
-	s.AddPrompt(mcp.NewPrompt("sg_query_guide",
-		mcp.WithPromptDescription("ShotGrid query guidance: filter syntax, dot notation, ordering, paging, and common gotchas."),
-	), func(_ context.Context, _ mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
-		return mcp.NewGetPromptResult(
-			"ShotGrid query guidance",
-			[]mcp.PromptMessage{
-				mcp.NewPromptMessage(mcp.RoleUser, mcp.NewTextContent(queryGuide)),
+	s.AddTool(minimcp.Tool{
+		Name:        "sg_entity_types",
+		Description: "List all entity types available in this ShotGrid instance.",
+		InputSchema: &minimcp.Schema{
+			Type: "object",
+			Properties: minimcp.Properties{
+				"project_id": {Type: "number", Description: "Optional project ID to get entity types in the context of a specific project."},
 			},
-		), nil
-	})
+		},
+	}, handleEntityTypes)
 
-	return s
+	s.AddTool(minimcp.Tool{
+		Name:        "sg_field_names",
+		Description: "List all field names for a ShotGrid entity type. Cheaper than sg_schema — use this first to discover fields, then call sg_schema for details on specific fields.",
+		InputSchema: &minimcp.Schema{
+			Type: "object",
+			Properties: minimcp.Properties{
+				"entity_type": {Type: "string", Description: "PascalCase entity type name, e.g. Shot, HumanUser"},
+				"project_id":  {Type: "number", Description: "Optional project ID for project-specific field visibility."},
+			},
+			Required: []string{"entity_type"},
+		},
+	}, handleFieldNames)
+
+	s.AddTool(minimcp.Tool{
+		Name:        "sg_schema",
+		Description: "Get field details (type, label, description, valid values) for a ShotGrid entity type. Pass fields to limit results to specific fields rather than returning the full schema.",
+		InputSchema: &minimcp.Schema{
+			Type: "object",
+			Properties: minimcp.Properties{
+				"entity_type": {Type: "string", Description: "PascalCase entity type name, e.g. Shot, HumanUser"},
+				"fields":      {Type: "array", Description: "Optional list of field names to return details for. Omit to return all fields.", Items: &minimcp.Schema{Type: "string"}},
+				"project_id":  {Type: "number", Description: "Optional project ID — required for accurate status values and project-specific field configuration."},
+			},
+			Required: []string{"entity_type"},
+		},
+	}, handleSchema)
+
+	s.AddTool(minimcp.Tool{
+		Name:        "sg_find",
+		Description: "Query ShotGrid entities. filters is a JSON string of [[field, operator, value], ...] triplets.",
+		InputSchema: &minimcp.Schema{
+			Type: "object",
+			Properties: minimcp.Properties{
+				"entity_type": {Type: "string", Description: "Entity type to query, e.g. Shot, Task"},
+				"filters":     {Type: "string", Description: `JSON array of [field, operator, value] triplets, e.g. [["sg_status_list","is","ip"],["project.Project.name","is","MyProject"]]`},
+				"fields":      {Type: "array", Description: "Fields to return", Items: &minimcp.Schema{Type: "string"}},
+				"limit":       {Type: "number", Description: "Max records to return (default 50)"},
+				"page":        {Type: "number", Description: "Page number, 1-indexed (default 1)"},
+				"order":       {Type: "string", Description: `JSON array of [field, direction] pairs, e.g. [["created_at","desc"],["code","asc"]]`},
+			},
+			Required: []string{"entity_type", "filters", "fields"},
+		},
+	}, handleFind)
+
+	s.AddTool(minimcp.Tool{
+		Name:        "sg_find_one",
+		Description: "Fetch a single ShotGrid entity. Returns null if nothing matches.",
+		InputSchema: &minimcp.Schema{
+			Type: "object",
+			Properties: minimcp.Properties{
+				"entity_type": {Type: "string", Description: "Entity type to query"},
+				"filters":     {Type: "string", Description: "JSON array of [field, operator, value] triplets"},
+				"fields":      {Type: "array", Description: "Fields to return", Items: &minimcp.Schema{Type: "string"}},
+				"order":       {Type: "string", Description: `JSON array of [field, direction] pairs, e.g. [["created_at","desc"]]`},
+			},
+			Required: []string{"entity_type", "filters", "fields"},
+		},
+	}, handleFindOne)
+
+	s.AddTool(minimcp.Tool{
+		Name:        "sg_text_search",
+		Description: "Search for text across entity types. Returns mixed-type results with basic attributes. Use sg_find to fetch full field sets for specific entities.",
+		InputSchema: &minimcp.Schema{
+			Type: "object",
+			Properties: minimcp.Properties{
+				"text":           {Type: "string", Description: "Text to search for."},
+				"entity_filters": {Type: "string", Description: `Optional JSON object mapping entity type names to filter arrays. Omit to search across Project, Episode, Sequence, Shot, Asset, Version, and Task. e.g. {"Shot": [["project.Project.id","is",421]], "Asset": []}`},
+				"limit":          {Type: "number", Description: "Max records to return (default 50)"},
+				"page":           {Type: "number", Description: "Page number, 1-indexed (default 1)"},
+				"order":          {Type: "string", Description: `JSON array of [field, direction] pairs, e.g. [["created_at","desc"]]`},
+			},
+			Required: []string{"text"},
+		},
+	}, handleTextSearch)
+
+	s.AddTool(minimcp.Tool{
+		Name:        "sg_summarize",
+		Description: "Aggregate field data for an entity type. Returns totals and optional per-group breakdowns. Use sg_summarize_types to check valid summary and grouping types for a field data type.",
+		InputSchema: &minimcp.Schema{
+			Type: "object",
+			Properties: minimcp.Properties{
+				"entity_type":    {Type: "string", Description: "Entity type to summarize, e.g. Shot, Task"},
+				"filters":        {Type: "string", Description: `JSON array of [field, operator, value] triplets. Pass "[]" to include all records.`},
+				"summary_fields": {Type: "string", Description: `JSON array of {field, type} objects, e.g. [{"field":"id","type":"count"},{"field":"cut_duration","type":"sum"}]`},
+				"grouping":       {Type: "string", Description: `Optional JSON array of {field, type, direction} objects, e.g. [{"field":"sg_status_list","type":"exact","direction":"asc"}]`},
+			},
+			Required: []string{"entity_type", "filters", "summary_fields"},
+		},
+	}, handleSummarize)
+
+	s.AddTool(minimcp.Tool{
+		Name:        "sg_summarize_types",
+		Description: "Return valid summary types and grouping types for a ShotGrid field data type. Use before building sg_summarize calls to avoid invalid type errors.",
+		InputSchema: &minimcp.Schema{
+			Type: "object",
+			Properties: minimcp.Properties{
+				"field_type": {Type: "string", Description: "Field data type to look up, e.g. number, date, status_list. Omit to return all types."},
+			},
+		},
+	}, handleSummarizeTypes)
+
+	s.AddTool(minimcp.Tool{
+		Name:        "sg_operators",
+		Description: "Return valid filter operators and argument signatures. Pass a field type to filter, or omit for all types. Types that don't support filtering: password, serializable, summary, url.",
+		InputSchema: &minimcp.Schema{
+			Type: "object",
+			Properties: minimcp.Properties{
+				"field_type": {Type: "string", Description: "Field type to get operators for, e.g. text, entity, date"},
+			},
+		},
+	}, handleOperators)
+
+	s.AddTool(minimcp.Tool{
+		Name:        "sg_data_types",
+		Description: "Return ShotGrid data type documentation: value types, formats, and ranges.",
+		InputSchema: &minimcp.Schema{
+			Type: "object",
+			Properties: minimcp.Properties{
+				"field_type": {Type: "string", Description: "Field type to get docs for, e.g. date, entity, url"},
+			},
+		},
+	}, handleDataTypes)
+
+	s.AddTool(minimcp.Tool{
+		Name:        "sg_docs_topics",
+		Description: "List all available ShotGrid API documentation topics.",
+		InputSchema: &minimcp.Schema{Type: "object"},
+	}, handleDocsTopics)
+
+	s.AddTool(minimcp.Tool{
+		Name:        "sg_docs",
+		Description: "Return ShotGrid API documentation for a topic. Call sg_docs_topics first to see what's available.",
+		InputSchema: &minimcp.Schema{
+			Type: "object",
+			Properties: minimcp.Properties{
+				"topic": {Type: "string", Description: "Topic path, e.g. reference, cookbook/usage_tips"},
+			},
+			Required: []string{"topic"},
+		},
+	}, handleDocs)
+
+	s.Register(d)
+	return d
 }
 
 // ---------------------------------------------------------------------------
@@ -610,7 +924,7 @@ func loadDotEnv() {
 }
 
 func main() {
-	http := flag.Bool("http", false, "Run as streamable-HTTP server instead of stdio")
+	useHTTP := flag.Bool("http", false, "Run as streamable-HTTP server instead of stdio")
 	addr := flag.String("addr", ":3000", "Listen address for HTTP mode")
 	flag.Parse()
 
@@ -620,17 +934,17 @@ func main() {
 		log.Fatalf("ShotGrid init failed: %v", err)
 	}
 
-	s := buildServer()
+	d := buildServer()
 
-	if *http {
+	if *useHTTP {
 		log.Printf("Starting HTTP server on %s", *addr)
-		if err := server.NewStreamableHTTPServer(s).Start(*addr); err != nil {
+		if err := http.ListenAndServe(*addr, minimcp.NewHTTPHandler(d)); err != nil {
 			log.Fatal(err)
 		}
 		return
 	}
 
-	if err := server.ServeStdio(s); err != nil {
+	if err := minimcp.ServeStdio(d, os.Stdin, os.Stdout); err != nil {
 		log.Fatal(err)
 	}
 }

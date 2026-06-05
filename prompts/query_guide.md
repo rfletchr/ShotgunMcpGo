@@ -55,8 +55,66 @@ the result depends on recency or priority.
 
 ## Paging
 
-`sg_find` returns one page of results. Default page size is 50, default page is 1.
-Increase `limit` or advance `page` to walk through large result sets.
+`sg_find` and `sg_text_search` return one page of results wrapped in `{"data": [...], "has_next": bool, "has_prev": bool}`.
+Default page size is 50, default page is 1. Check `has_next` to know whether more records exist before advancing `page`.
+
+## Text search
+
+`sg_text_search(text, entity_filters, limit?, page?, order?)` searches across entity types by text.
+`entity_filters` is **required** — the API needs at least one entity type specified.
+Results contain mixed entity types with basic attributes — use `sg_find` to fetch full field sets
+for the IDs you want.
+
+`entity_filters` is a JSON object mapping entity type names to filter arrays (same triplet format as `sg_find` filters).
+Use an empty array `[]` to include all records of that type with no additional filter:
+
+```json
+{"Shot": [["project.Project.id", "is", 421]], "Asset": []}
+```
+
+## Summarize
+
+`sg_summarize(entity_type, filters, summary_fields, grouping?)` aggregates field data.
+
+`summary_fields` is a JSON array of `{field, type}` objects:
+```json
+[{"field": "id", "type": "count"}, {"field": "cut_duration", "type": "sum"}]
+```
+
+Valid summary types: `record_count`, `count`, `sum`, `maximum`, `minimum`, `average`,
+`earliest`, `latest`, `percentage`, `status_percentage`, `status_percentage_as_float`,
+`status_list`, `checked`, `unchecked`.
+
+- `record_count` counts matched records regardless of whether the field has a value; `count` counts non-null values for a specific field.
+- Valid types depend on the field's data type — use `sg_summarize_types(field_type)` to check before building a query.
+
+`grouping` (optional) is a JSON array of `{field, type, direction}` objects:
+```json
+[{"field": "sg_status_list", "type": "exact", "direction": "asc"}]
+```
+
+Valid grouping types: `exact`, `tens`, `hundreds`, `thousands`, `tensofthousands`,
+`hundredsofthousands`, `millions`, `day`, `week`, `month`, `quarter`, `year`,
+`clustered_date`, `oneday`, `fivedays`, `entitytype`, `firstletter`.
+
+Multiple grouping objects produce nested buckets.
+
+### Summarize response shape
+
+```json
+{
+  "summaries": {"id": 1649},
+  "groups": [
+    {"group_name": "ip", "group_value": "ip", "summaries": {"id": 42}},
+    {"group_name": "wtg", "group_value": "wtg", "summaries": {"id": 107}}
+  ]
+}
+```
+
+- `summaries` — totals across all matched records (always present).
+- `groups` — one entry per bucket; only present when `grouping` is specified.
+- When grouping by an entity field, `group_value` is a full entity dict rather than a plain string: `{"type": "Asset", "id": 922, "name": "PuppyA"}`.
+- Nested grouping: each group entry may itself contain a `groups` array with the same structure for the next grouping level.
 
 ## Linked entity fields
 
