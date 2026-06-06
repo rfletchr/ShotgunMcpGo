@@ -5,15 +5,11 @@ A [Model Context Protocol](https://modelcontextprotocol.io) server for ShotGrid 
 Gives your LLM **accurate**, live knowledge of your ShotGrid instance — schema, entities, filter operators, and embedded API docs — so it can write reliable pipeline code without hallucinating field names or entity types.
 
 
-
-Built on [ShotgunGo](https://github.com/rfletchr/ShotgunGo) and [mcp-go](https://github.com/mark3labs/mcp-go). Compiles to a single self-contained binary with all documentation embedded.
+Built on [ShotgunGo](https://github.com/rfletchr/ShotgunGo) and [MiniMcp](https://github.com/rfletchr/MiniMcp). Compiles to a single self-contained binary with all documentation embedded.
 
 ## Security
-This service requires you to provide credentials so some due-diligence is required, I've done my best to make sure the dependencies used in this project are secure and free from tampering.
-
-`go.sum` is committed and pins the cryptographic hash of every dependency, ensuring reproducible builds and rejecting any dependency that has been tampered with.
-
-The docker image build process mandates that `govulncheck` is run as part of the build process, ensuring that any dependencies which are later found to have known vulnerabilities are rejected.
+This service requires you to provide credentials so some due-diligence is required, It's written in 100% stdlib go, all dependenceis are my own and also 100% stdlib.
+The docker image build process mandates that `govulncheck` is run as part of the build process, ensuring that any stdlib vulnerabilities break the build process and require a go update.
 
 If you want to run this standalone please make sure you run the following before building or running:
 ```bash
