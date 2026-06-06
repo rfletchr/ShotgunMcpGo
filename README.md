@@ -2,20 +2,17 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server for ShotGrid (aka. Flow Production Tracking, Shotgun, Shitgord, Prince). 
 
-Gives your LLM **accurate**, live knowledge of your ShotGrid instance — schema, entities, filter operators, and embedded API docs — so it can write reliable pipeline code without hallucinating field names or entity types.
+Gives your LLM **accurate**, live knowledge of your ShotGrid instance providing schema, entities, filter operators, and embedded API docs, allowing it to write reliable pipeline code without hallucinating field names or entity types.
 
 
-Built on [ShotgunGo](https://github.com/rfletchr/ShotgunGo) and [MiniMcp](https://github.com/rfletchr/MiniMcp). Compiles to a single self-contained binary with all documentation embedded.
+- Built on [ShotgunGo](https://github.com/rfletchr/ShotgunGo) and [MiniMcp](https://github.com/rfletchr/MiniMcp) 100% stdlib go.
+- Compiles to a single self-contained binary on linux, mac, and windows.
 
 ## Security
-This service requires you to provide credentials so some due-diligence is required, It's written in 100% stdlib go, all dependenceis are my own and also 100% stdlib.
-The docker image build process mandates that `govulncheck` is run as part of the build process, ensuring that any stdlib vulnerabilities break the build process and require a go update.
+This service is written in 100% stdlib go with no exernally owned dependencies, so no supply chain attack risk.
+The build process uses go's vulncheck system to detect any stdlib issues,
+This shouldn't however be an issue as you'll be running this in a controlled environment. cant hurt.
 
-If you want to run this standalone please make sure you run the following before building or running:
-```bash
-go install golang.org/x/vuln/cmd/govulncheck@latest
-govulncheck ./...
-```
 
 ## Tools
 
