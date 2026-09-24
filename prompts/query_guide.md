@@ -142,3 +142,18 @@ To access additional fields on a linked entity, either:
 - Date values must be `"YYYY-MM-DD"` strings. Datetimes are UTC on the server;
   the API converts to/from client local time automatically.
 - Fields not explicitly requested are not returned. Always specify every field you need.
+
+## Large result sets
+
+Don't page through big results with `sg_find` — every row you read lands in the conversation.
+For anything beyond a few dozen rows, or when you need to filter, group, or join the data,
+use `sg_find_csv` to write the full result to a CSV file (only the path and row count come
+back), then load it into SQLite (`import_csv` with `create=true`, `sample_rows=-1`) and query
+it with SQL. Use `host_path` from the result as the CSV path.
+
+## API documentation
+
+`sg_docs_topics` browses the API docs as a tree and `sg_docs` returns one section. Start with
+`sg_docs_topics` (no arguments) and drill down by ID; each line shows the section's size, so
+you can pick a small one instead of pulling a whole page. For example the signature and
+parameters of `Shotgun.find` are `sg_docs(id="reference/shotgun_methods/crud_methods/find")`.

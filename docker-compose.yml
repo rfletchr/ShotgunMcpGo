@@ -1,7 +1,15 @@
 services:
   shotgrid-mcp:
     build: .
+    # Run as the host user that owns SG_EXPORT_HOST_DIR so exported CSVs are
+    # readable/deletable by you, not root-owned.
+    user: "${SG_EXPORT_UID:-1000}:${SG_EXPORT_GID:-1000}"
     ports:
       - "127.0.0.1:3000:3000"
     env_file: .env
+    environment:
+      SG_EXPORT_DIR: /exports
+      SG_EXPORT_HOST_DIR: ${SG_EXPORT_HOST_DIR:?set SG_EXPORT_HOST_DIR in .env to an existing absolute host directory}
+    volumes:
+      - ${SG_EXPORT_HOST_DIR}:/exports
     restart: unless-stopped
